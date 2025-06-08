@@ -22,7 +22,7 @@
    * **macOS/Linux**:
 
      ```bash
-     source .env/bin/activate
+     source .venv/bin/activate
      ```
 
 4. **Install dependensi**:
@@ -47,7 +47,12 @@ API akan berjalan di: `http://127.0.0.1:5000`
 
 * **Method**: `POST`
 * **Endpoint**: `http://127.0.0.1:5000/predict`
-* **Body**: JSON (raw)
+* **Authorization**:
+    * Type: `Bearer Token`
+    * Token: `your_jwt_token_here`
+* **Body**: `form-data`
+    * KEY: `file`
+    * VALUE: (pilih tipe `File` dan unggah gambar Anda)
 
 ```json
 {

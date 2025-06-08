@@ -6,7 +6,6 @@ import os
 from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
-import cloudinary.api
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
@@ -15,17 +14,23 @@ from tensorflow.keras.models import load_model
 from PIL import Image
 import numpy as np
 import io
-import requests
-from werkzeug.utils import secure_filename
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all origins on all routes
+CORS(app)
 
+# --- KONFIGURASI ---
 # Load model
-model = load_model("model_densenetRcnn.h5")
+try:
+    model = load_model("model_densenetRcnn.h5")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    # Jika model tidak ada, aplikasi tidak bisa berjalan
+    # Sebaiknya hentikan aplikasi jika model gagal dimuat
+    exit()
+
 IMG_SIZE = (255, 255)
 labels = ['Dr', 'No_Dr']
 
@@ -42,18 +47,21 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # JWT Configuration
 JWT_SECRET = os.getenv("JWT_SECRET")
 
+# --- KONEKSI DATABASE ---
 def get_db_connection():
+    """Membuat koneksi ke database."""
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
     return conn
 
+# --- DECORATOR AUTENTIKASI ---
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
+        auth_header = request.headers.get('Authorization')
         
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
+        if auth_header and auth_header.startswith('Bearer '):
             try:
                 token = auth_header.split(" ")[1]
             except IndexError:
@@ -74,45 +82,29 @@ def token_required(f):
     
     return decorated
 
+# --- FUNGSI HELPER ---
 def allowed_file(filename):
+    """Mengecek apakah ekstensi file diizinkan."""
     return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg', 'gif'}
+           filename.rsplit('.', 1)[1].lower() in {'png', 'jpg', 'jpeg'}
 
-def save_to_db(user_id, image_url, image_id, predicted_class, confidence):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        record_id = str(uuid.uuid4())
-        now = datetime.now()
-        
-        query = """
-        INSERT INTO retina_history 
-            (id, image, "imageId", "predictedClass", "confidenceClass", "createdAt", "updatedAt", "userId")
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        cursor.execute(query, (
-            record_id, 
-            image_url, 
-            image_id, 
-            predicted_class, 
-            confidence, 
-            now, 
-            now,
-            user_id
-        ))
-        
-        cursor.close()
-        return record_id
-    except Exception as e:
-        print(f"Database error: {str(e)}")
-        raise
-    finally:
-        if conn:
-            conn.close()
+def process_and_predict_image(file_stream):
+    """Fungsi utama untuk memproses gambar dan melakukan prediksi."""
+    # Preprocess image dari file stream di memori
+    img = Image.open(file_stream).convert('RGB')
+    img = img.resize(IMG_SIZE)
+    img_array = np.array(img) / 255.0
+    img_array = (img_array - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+    img_array = np.expand_dims(img_array, axis=0)
 
+    # Prediksi
+    predictions = model.predict(img_array)
+    predicted_class = labels[np.argmax(predictions)]
+    confidence = float(np.max(predictions))
+
+    return predicted_class, confidence
+
+# --- ENDPOINTS ---
 @app.route('/predict', methods=['POST'])
 @token_required
 def predict(current_user_id):
@@ -128,64 +120,54 @@ def predict(current_user_id):
         return jsonify({'error': 'File type not allowed'}), 400
         
     try:
-        # Upload to Cloudinary
+        # Baca file ke memori untuk diproses
+        in_memory_file = io.BytesIO()
+        file.save(in_memory_file)
+        in_memory_file.seek(0)
+        
+        # Lakukan prediksi menggunakan helper function
+        predicted_class, confidence = process_and_predict_image(in_memory_file)
+        
+        # Setelah prediksi, upload file ke Cloudinary
+        in_memory_file.seek(0)
         upload_result = cloudinary.uploader.upload(
-            file,
+            in_memory_file,
             folder="predictions",
-            use_filename=True,
-            unique_filename=True,
-            overwrite=False,
-            transformation=[
-                {'width': 500, 'height': 500, 'crop': 'limit'}
-            ]
+            unique_filename=True
         )
         
-        # Get image from Cloudinary URL
-        image_url = upload_result['secure_url']
-        response = requests.get(image_url)
-        img = Image.open(io.BytesIO(response.content)).convert('RGB')
-        img = img.resize(IMG_SIZE)
-
-        # Preprocess image
-        img_array = np.array(img) / 255.0
-        img_array = (img_array - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-        img_array = np.expand_dims(img_array, axis=0)
-
-        # Predict
-        predictions = model.predict(img_array)
-        predicted_class = labels[np.argmax(predictions)]
-        confidence = float(np.max(predictions))
-        
-        # Save to database with user_id
-        image_id = upload_result['public_id']
-        record_id = save_to_db(
-            user_id=current_user_id,
-            image_url=image_url,
-            image_id=image_id,
-            predicted_class=predicted_class,
-            confidence=confidence
-        )
+        # Simpan ke database
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            record_id = str(uuid.uuid4())
+            now = datetime.now()
+            
+            query = """
+            INSERT INTO retina_history (id, image, "imageId", "predictedClass", "confidenceClass", "createdAt", "updatedAt", "userId")
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(query, (
+                record_id, upload_result['secure_url'], upload_result['public_id'], 
+                predicted_class, confidence, now, now, current_user_id
+            ))
+            cursor.close()
+        finally:
+            if conn:
+                conn.close()
 
         return jsonify({
             'success': True,
-            'user_id': current_user_id,
             'record_id': record_id,
-            'prediction': {
-                'class': predicted_class,
-                'confidence': confidence
-            },
-            'image': {
-                'public_id': upload_result['public_id'],
-                'url': image_url,
-                'format': upload_result['format'],
-                'width': upload_result['width'],
-                'height': upload_result['height']
-            }
+            'prediction': {'class': predicted_class, 'confidence': confidence},
+            'image': {'public_id': upload_result['public_id'], 'url': upload_result['secure_url']}
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Error during prediction for user {current_user_id}: {str(e)}")
+        return jsonify({'error': 'An internal error occurred'}), 500
 
-@app.route('/predicted/guest', methods=['POST'])
+@app.route('/predict/guest', methods=['POST'])
 def predict_guest():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part in the request'}), 400
@@ -199,85 +181,51 @@ def predict_guest():
         return jsonify({'error': 'File type not allowed'}), 400
         
     try:
-        # Upload to Cloudinary
+        # Baca file ke memori
+        in_memory_file = io.BytesIO()
+        file.save(in_memory_file)
+        in_memory_file.seek(0)
+        
+        # Lakukan prediksi
+        predicted_class, confidence = process_and_predict_image(in_memory_file)
+        
+        # Upload ke Cloudinary
+        in_memory_file.seek(0)
         upload_result = cloudinary.uploader.upload(
-            file,
+            in_memory_file,
             folder="guest_predictions",
-            use_filename=True,
-            unique_filename=True,
-            overwrite=False,
-            transformation=[
-                {'width': 500, 'height': 500, 'crop': 'limit'}
-            ]
+            unique_filename=True
         )
         
-        # Preprocess image
-        image_url = upload_result['secure_url']
-        response = requests.get(image_url)
-        img = Image.open(io.BytesIO(response.content)).convert('RGB')
-        img = img.resize(IMG_SIZE)
-
-        # Predict
-        img_array = np.array(img) / 255.0
-        img_array = (img_array - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        predictions = model.predict(img_array)
-        predicted_class = labels[np.argmax(predictions)]
-        confidence = float(np.max(predictions))
-        
-        # Save to guest history table
+        # Simpan ke database
         conn = None
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            
             record_id = str(uuid.uuid4())
             now = datetime.now()
-            
             query = """
-            INSERT INTO retina_history_guest 
-                (id, image, "imageId", "predictedClass", "confidenceClass", "createdAt", "updatedAt")
+            INSERT INTO retina_history_guest (id, image, "imageId", "predictedClass", "confidenceClass", "createdAt", "updatedAt")
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
-            
             cursor.execute(query, (
-                record_id, 
-                image_url, 
-                upload_result['public_id'], 
-                predicted_class, 
-                confidence, 
-                now, 
-                now
+                record_id, upload_result['secure_url'], upload_result['public_id'],
+                predicted_class, confidence, now, now
             ))
-            
             cursor.close()
-            
-            return jsonify({
-                'success': True,
-                'record_id': record_id,
-                'prediction': {
-                    'class': predicted_class,
-                    'confidence': confidence
-                },
-                'image': {
-                    'public_id': upload_result['public_id'],
-                    'url': image_url,
-                    'format': upload_result['format'],
-                    'width': upload_result['width'],
-                    'height': upload_result['height']
-                }
-            })
-            
-        except Exception as e:
-            print(f"Database error: {str(e)}")
-            return jsonify({'error': 'Failed to save prediction'}), 500
         finally:
             if conn:
                 conn.close()
-
+                
+        return jsonify({
+            'success': True,
+            'record_id': record_id,
+            'prediction': {'class': predicted_class, 'confidence': confidence},
+            'image': {'public_id': upload_result['public_id'], 'url': upload_result['secure_url']}
+        })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Error during guest prediction: {str(e)}")
+        return jsonify({'error': 'An internal error occurred'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
